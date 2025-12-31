@@ -1,0 +1,10 @@
+# Generated artifacts
+/target/
+
+# Backup files
+**/*.rs.bk
+*.swp
+
+# OS Specific
+.DS_Store
+Thumbs.db
