@@ -3,11 +3,50 @@ use crate::dns_utils::{LogRecord, DnsFlow};
 use crate::reasm::{L4Msg, Reassembler};
 use crossbeam_channel::Receiver;
 use dashmap::DashMap;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, Duration};
 use log::info;
 use std::thread;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use dns_parser::Name; 
+use dns_parser::Name;
+
+/// JSON log destination. Omit the path, or pass "-", to keep stdout.
+#[derive(Clone)]
+pub struct LogOut {
+    inner: Arc<Mutex<Box<dyn Write + Send>>>,
+}
+
+impl LogOut {
+    pub fn stdout() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Box::new(io::stdout()))),
+        }
+    }
+
+    /// Create or append. Each line is flushed so a copytruncate still sees it.
+    pub fn open(path: &str) -> io::Result<Self> {
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o644);
+        }
+        let file = opts.open(path)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(Box::new(file))),
+        })
+    }
+
+    fn write_line(&self, line: &str) {
+        let mut w = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if writeln!(w, "{line}").is_err() || w.flush().is_err() {
+            eprintln!("[!] failed to write log line");
+        }
+    }
+} 
 
 type ContextMap = DashMap<String, (DnsFlow, SystemTime)>;
 
@@ -20,28 +59,29 @@ struct CacheState {
 
 type OutputCache = DashMap<String, CacheState>;
 
-pub fn run_parser(rx: Receiver<PacketObj>, cache_time: u64, print_time: u64, check_interval: u64) {
+pub fn run_parser(rx: Receiver<PacketObj>, log: LogOut, cache_time: u64, print_time: u64, check_interval: u64) {
     let context: ContextMap = DashMap::new();
     let output_cache: std::sync::Arc<OutputCache> = std::sync::Arc::new(DashMap::new());
 
     let cache_ref = output_cache.clone();
+    let cache_log = log.clone();
     
     thread::spawn(move || {
-        cleanup_loop(cache_ref, Duration::from_secs(cache_time), Duration::from_secs(print_time), Duration::from_secs(check_interval));
+        cleanup_loop(cache_log, cache_ref, Duration::from_secs(cache_time), Duration::from_secs(print_time), Duration::from_secs(check_interval));
     });
 
     info!("Parser thread started (Cache: {}s, Print: {}s, Check: {}s)", cache_time, print_time, check_interval);
 
     let mut reasm = Reassembler::new();
     while let Ok(pkt) = rx.recv() {
-        parse_packet(&pkt, &mut reasm, &context, &output_cache);
+        parse_packet(&pkt, &mut reasm, &context, &output_cache, &log);
     }
     // Write each cache entry's pending sightings. cnt is that
     // unwritten count. An entry already fully logged is skipped.
-    flush_output_cache(&output_cache);
+    flush_output_cache(&log, &output_cache);
 }
 
-fn flush_output_cache(cache: &OutputCache) {
+fn flush_output_cache(log: &LogOut, cache: &OutputCache) {
     for mut entry in cache.iter_mut() {
         let state = entry.value_mut();
         if state.record.count <= state.printed_count {
@@ -52,17 +92,18 @@ fn flush_output_cache(cache: &OutputCache) {
         print_rec.ts = now_iso();
         state.printed_count = state.record.count;
         state.last_printed = SystemTime::now();
-        emit(&print_rec);
+        emit(log, &print_rec);
     }
 }
 
-fn emit(record: &LogRecord) {
+fn emit(log: &LogOut, record: &LogRecord) {
     let s = serde_json::to_string(record).unwrap_or_default();
-    if let Some(i) = s.rfind("\"qtm\":") {
-        println!("{}\"qtm\":{:.6}}}", &s[..i], record.latency);
+    let line = if let Some(i) = s.rfind("\"qtm\":") {
+        format!("{}\"qtm\":{:.6}}}", &s[..i], record.latency)
     } else {
-        println!("{}", s);
-    }
+        s
+    };
+    log.write_line(&line);
 }
 
 fn to_iso(ts: SystemTime) -> String {
@@ -181,7 +222,7 @@ fn b64(data: &[u8]) -> String {
     out
 }
 
-fn cleanup_loop(cache: std::sync::Arc<OutputCache>, expiration: Duration, print_interval: Duration, check_interval: Duration) {
+fn cleanup_loop(log: LogOut, cache: std::sync::Arc<OutputCache>, expiration: Duration, print_interval: Duration, check_interval: Duration) {
     loop {
         thread::sleep(check_interval);
         let mut keys_to_remove = Vec::new();
@@ -196,7 +237,7 @@ fn cleanup_loop(cache: std::sync::Arc<OutputCache>, expiration: Duration, print_
                     let mut print_rec = state.record.clone();
                     print_rec.count = delta;
                     print_rec.ts = now_iso();
-                    emit(&print_rec);
+                    emit(&log, &print_rec);
                 }
                 keys_to_remove.push(key.clone());
                 continue;
@@ -209,7 +250,7 @@ fn cleanup_loop(cache: std::sync::Arc<OutputCache>, expiration: Duration, print_
                     let mut print_rec = state.record.clone();
                     print_rec.count = delta;
                     print_rec.ts = now_iso();
-                    emit(&print_rec);
+                    emit(&log, &print_rec);
 
                     state.printed_count = state.record.count;
                     state.last_printed = now;
@@ -426,13 +467,13 @@ fn parse_https_record(data: &[u8]) -> String {
     parts.join(" ")
 }
 
-fn parse_packet(pkt: &PacketObj, reasm: &mut Reassembler, ctx: &ContextMap, cache: &DashMap<String, CacheState>) {
+fn parse_packet(pkt: &PacketObj, reasm: &mut Reassembler, ctx: &ContextMap, cache: &DashMap<String, CacheState>, log: &LogOut) {
     for msg in reasm.push(&pkt.data, pkt.ts) {
-        parse_dns(pkt.ts, &msg, ctx, cache);
+        parse_dns(pkt.ts, &msg, ctx, cache, log);
     }
 }
 
-fn parse_dns(ts: SystemTime, msg: &L4Msg, ctx: &ContextMap, cache: &DashMap<String, CacheState>) {
+fn parse_dns(ts: SystemTime, msg: &L4Msg, ctx: &ContextMap, cache: &DashMap<String, CacheState>, log: &LogOut) {
     let vlan_id = msg.vlan;
     let src_ip = msg.src.clone();
     let dst_ip = msg.dst.clone();
@@ -658,7 +699,7 @@ fn parse_dns(ts: SystemTime, msg: &L4Msg, ctx: &ContextMap, cache: &DashMap<Stri
                 }
                 state.last_seen = SystemTime::now();
             } else {
-                emit(&record);
+                emit(log, &record);
                 cache.insert(cache_key, CacheState {
                     record,
                     last_seen: SystemTime::now(),
@@ -667,5 +708,28 @@ fn parse_dns(ts: SystemTime, msg: &L4Msg, ctx: &ContextMap, cache: &DashMap<Stri
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LogOut;
+
+    #[test]
+    fn logfile_appends_and_keeps_existing_lines() {
+        let path = std::env::temp_dir().join(format!(
+            "pdnsrust-log-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let path_str = path.to_str().expect("temp path");
+        LogOut::open(path_str).unwrap().write_line("{\"n\":1}");
+        LogOut::open(path_str).unwrap().write_line("{\"n\":2}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(text, "{\"n\":1}\n{\"n\":2}\n");
     }
 }

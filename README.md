@@ -8,6 +8,7 @@ A high-performance, multithreaded DNS sniffer written in Rust, focusing on memor
 * **Compatible**: Outputs JSON logs schema-compatible with the passivednsgo version.
 * **Tunable**: Configurable cache eviction, heartbeat printing, and garbage collection intervals.
 * **Reassembly**: IPv4 and IPv6 fragments are reassembled. TCP DNS messages are buffered across segments.
+* **Logs**: JSON lines go to stdout. `--logfile` appends them to a file; `-` is stdout.
 
 ## Limitations
 * **Fanout**: Uses a single capture handle. It does not utilize kernel-level `AF_PACKET` fanout groups, so capture throughput is limited to a single CPU core.
@@ -20,6 +21,9 @@ cargo build --release
 
 # Run (requires root or CAP_NET_RAW)
 sudo ./target/release/passivednsrust --interface eth0
+
+# On a host, append to a file. Leave --logfile off in Kubernetes.
+sudo ./target/release/passivednsrust --interface eth0 --logfile /var/log/passivednsrust.json
 
 ```
 

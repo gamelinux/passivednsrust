@@ -37,6 +37,10 @@ struct Config {
     /// Read this pcap instead of a live interface.
     #[arg(long)]
     pcap: Option<String>,
+
+    /// Append JSON logs to this file. Omit it, or pass "-", to write stdout.
+    #[arg(short = 'l', long)]
+    logfile: Option<String>,
 }
 
 fn main() {
@@ -58,9 +62,19 @@ fn main() {
     let parser_cache_time = config.cache_time;
     let parser_print_time = config.print_time;
     let parser_check_interval = config.check_interval;
+    let log = match config.logfile.as_deref() {
+        None | Some("-") => parser::LogOut::stdout(),
+        Some(path) => match parser::LogOut::open(path) {
+            Ok(log) => log,
+            Err(e) => {
+                eprintln!("[!] Cannot open logfile {path}: {e}");
+                std::process::exit(1);
+            }
+        },
+    };
 
     let parser_handle = thread::spawn(move || {
-        parser::run_parser(packet_rx, parser_cache_time, parser_print_time, parser_check_interval);
+        parser::run_parser(packet_rx, log, parser_cache_time, parser_print_time, parser_check_interval);
     });
 
     let capture_config = config.clone();
