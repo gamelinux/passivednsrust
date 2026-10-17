@@ -31,9 +31,9 @@ You can tune the caching and printing behavior to match your traffic load:
 sudo ./target/release/passivednsrust \
   --interface eth0 \
   --threads 1 \
-  --cache-time 21600 \    # Evict flows after 6 hours of inactivity
-  --print-time 43200 \    # Print "heartbeat" logs for active flows every 12 hours
-  --check-interval 60     # Run the cleanup/expiration scan every 60 seconds
+  --cache-time 43200 \    # Drop an idle answer after 12 hours
+  --print-time 86400 \    # Write new sightings of an active answer every 24 hours
+  --check-interval 600    # Scan the cache every 10 minutes
 
 ```
 

@@ -15,22 +15,22 @@ struct Config {
     #[arg(short, long, default_value = "any")]
     interface: String,
 
-    #[arg(short, long, default_value = "udp and port 53")]
+    #[arg(short, long, default_value = "(port 53) or (ip[6:2] & 0x3fff != 0) or (ip6[6] = 0) or (ip6[6] = 43) or (ip6[6] = 44) or (ip6[6] = 60)")]
     bpf: String,
 
     #[arg(short, long, default_value_t = 1)]
     threads: usize,
 
-    /// Time (seconds) before an idle flow is removed from cache
-    #[arg(long, default_value_t = 21600)] 
+    /// Seconds an idle answer stays cached before it is dropped. Default is 12 hours.
+    #[arg(long, default_value_t = 43200)]
     cache_time: u64,
 
-    /// Time (seconds) to print an intermediate log for active flows
-    #[arg(long, default_value_t = 43200)]
+    /// Seconds before new sightings of an active answer are written. Default is 24 hours.
+    #[arg(long, default_value_t = 86400)]
     print_time: u64,
 
-    /// Interval (seconds) to scan the cache for expiration/printing
-    #[arg(long, default_value_t = 60)]
+    /// Seconds between cache scans. Default is 10 minutes.
+    #[arg(long, default_value_t = 600)]
     check_interval: u64,
 
     /// Read this pcap instead of a live interface.
