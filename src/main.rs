@@ -7,7 +7,7 @@ use log::{info, error};
 use std::thread;
 use crossbeam_channel::bounded;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -32,6 +32,10 @@ struct Config {
     /// Interval (seconds) to scan the cache for expiration/printing
     #[arg(long, default_value_t = 60)]
     check_interval: u64,
+
+    /// Read this pcap instead of a live interface.
+    #[arg(long)]
+    pcap: Option<String>,
 }
 
 fn main() {
@@ -41,9 +45,10 @@ fn main() {
     info!("Starting PassiveDNS Rust on interface: {}", config.interface);
 
     let running = Arc::new(AtomicBool::new(true));
+    let stop = running.clone();
     ctrlc::set_handler(move || {
-        error!("Ctrl+C received! Forcing exit...");
-        std::process::exit(0);
+        error!("Ctrl+C received, stopping.");
+        stop.store(false, Ordering::SeqCst);
     }).expect("Error setting Ctrl-C handler");
 
     let (packet_tx, packet_rx) = bounded(10_000);
@@ -59,7 +64,7 @@ fn main() {
 
     let capture_config = config.clone();
     let capture_handle = thread::spawn(move || {
-        if let Err(e) = capture::run_capture(capture_config.interface, capture_config.bpf, packet_tx, running) {
+        if let Err(e) = capture::run_capture(capture_config.interface, capture_config.bpf, capture_config.pcap, packet_tx, running) {
             error!("Capture failed: {}", e);
         }
     });

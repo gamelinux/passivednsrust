@@ -35,11 +35,148 @@ pub fn run_parser(rx: Receiver<PacketObj>, cache_time: u64, print_time: u64, che
     while let Ok(pkt) = rx.recv() {
         parse_packet(&pkt, &context, &output_cache);
     }
+    // Write each cache entry's pending sightings. cnt is that
+    // unwritten count. An entry already fully logged is skipped.
+    flush_output_cache(&output_cache);
+}
+
+fn flush_output_cache(cache: &OutputCache) {
+    for mut entry in cache.iter_mut() {
+        let state = entry.value_mut();
+        if state.record.count <= state.printed_count {
+            continue;
+        }
+        let mut print_rec = state.record.clone();
+        print_rec.count = state.record.count - state.printed_count;
+        print_rec.ts = now_iso();
+        state.printed_count = state.record.count;
+        state.last_printed = SystemTime::now();
+        emit(&print_rec);
+    }
+}
+
+fn emit(record: &LogRecord) {
+    let s = serde_json::to_string(record).unwrap_or_default();
+    if let Some(i) = s.rfind("\"qtm\":") {
+        println!("{}\"qtm\":{:.6}}}", &s[..i], record.latency);
+    } else {
+        println!("{}", s);
+    }
 }
 
 fn to_iso(ts: SystemTime) -> String {
     let datetime: chrono::DateTime<chrono::Utc> = ts.into();
-    datetime.to_rfc3339()
+    datetime.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+}
+
+fn strip_dot(s: String) -> String {
+    if s.len() > 1 && s.ends_with('.') {
+        let mut t = s;
+        t.pop();
+        t
+    } else {
+        s
+    }
+}
+
+fn type_name(code: u16) -> String {
+    let name = match code {
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        6 => "SOA",
+        12 => "PTR",
+        15 => "MX",
+        16 => "TXT",
+        17 => "RP",
+        28 => "AAAA",
+        29 => "LOC",
+        33 => "SRV",
+        35 => "NAPTR",
+        39 => "DNAME",
+        43 => "DS",
+        44 => "SSHFP",
+        46 => "RRSIG",
+        47 => "NSEC",
+        48 => "DNSKEY",
+        50 => "NSEC3",
+        51 => "NSEC3PARAM",
+        52 => "TLSA",
+        64 => "SVCB",
+        65 => "HTTPS",
+        99 => "SPF",
+        255 => "ANY",
+        257 => "CAA",
+        _ => return format!("TYPE{}", code),
+    };
+    name.to_string()
+}
+
+fn rcode_name(code: u16) -> String {
+    match code {
+        0 => "NOERROR".to_string(),
+        1 => "FORMERR".to_string(),
+        2 => "SERVFAIL".to_string(),
+        3 => "NXDOMAIN".to_string(),
+        4 => "NOTIMP".to_string(),
+        5 => "REFUSED".to_string(),
+        6 => "YXDOMAIN".to_string(),
+        7 => "YXRRSET".to_string(),
+        8 => "NXRRSET".to_string(),
+        9 => "NOTAUTH".to_string(),
+        10 => "NOTZONE".to_string(),
+        n => format!("RCODE{}", n),
+    }
+}
+
+fn txt_chars(rdata: &[u8]) -> String {
+    let mut out = String::new();
+    let mut p = 0;
+    while p < rdata.len() {
+        let n = rdata[p] as usize;
+        p += 1;
+        if p + n > rdata.len() {
+            break;
+        }
+        out.push_str(&String::from_utf8_lossy(&rdata[p..p + n]));
+        p += n;
+    }
+    out
+}
+
+fn b64(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(T[((n >> 6) & 63) as usize] as char);
+        out.push(T[(n & 63) as usize] as char);
+        i += 3;
+    }
+    if i < data.len() {
+        let rem = data.len() - i;
+        let mut n = (data[i] as u32) << 16;
+        if rem == 2 {
+            n |= (data[i + 1] as u32) << 8;
+        }
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        if rem == 2 {
+            out.push(T[((n >> 6) & 63) as usize] as char);
+            out.push('=');
+        } else {
+            out.push('=');
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn cleanup_loop(cache: std::sync::Arc<OutputCache>, expiration: Duration, print_interval: Duration, check_interval: Duration) {
@@ -54,9 +191,10 @@ fn cleanup_loop(cache: std::sync::Arc<OutputCache>, expiration: Duration, print_
             if age > expiration {
                 let delta = state.record.count - state.printed_count;
                 if delta > 0 {
-                    state.record.count = delta;
-                    state.record.ts = chrono::Utc::now().to_rfc3339();
-                    println!("{}", serde_json::to_string(&state.record).unwrap());
+                    let mut print_rec = state.record.clone();
+                    print_rec.count = delta;
+                    print_rec.ts = now_iso();
+                    emit(&print_rec);
                 }
                 keys_to_remove.push(key.clone());
                 continue;
@@ -68,8 +206,8 @@ fn cleanup_loop(cache: std::sync::Arc<OutputCache>, expiration: Duration, print_
                 if delta > 0 {
                     let mut print_rec = state.record.clone();
                     print_rec.count = delta;
-                    print_rec.ts = chrono::Utc::now().to_rfc3339();
-                    println!("{}", serde_json::to_string(&print_rec).unwrap());
+                    print_rec.ts = now_iso();
+                    emit(&print_rec);
 
                     state.printed_count = state.record.count;
                     state.last_printed = now;
@@ -102,75 +240,186 @@ fn get_wire_name_len(data: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
-fn parse_https_record(data: &[u8]) -> String {
-    if data.len() < 2 { return String::new(); }
-    let mut pos = 0;
-    let read_u16 = |b: &[u8]| -> u16 { ((b[0] as u16) << 8) | (b[1] as u16) };
+fn svc_key_name(key: u16) -> String {
+    match key {
+        0 => "mandatory".to_string(),
+        1 => "alpn".to_string(),
+        2 => "no-default-alpn".to_string(),
+        3 => "port".to_string(),
+        4 => "ipv4hint".to_string(),
+        5 => "ech".to_string(),
+        6 => "ipv6hint".to_string(),
+        7 => "dohpath".to_string(),
+        n => format!("key{}", n),
+    }
+}
 
-    // 1. Priority
-    let priority = read_u16(&data[pos..pos+2]);
+fn svc_escape(val: &[u8]) -> String {
+    let quote = val.iter().any(|c| c.is_ascii_whitespace());
+    let mut out = String::new();
+    if quote {
+        out.push('"');
+    }
+    for &c in val {
+        if c == b'"' || c == b'\\' {
+            out.push('\\');
+            out.push(c as char);
+        } else if c == b'\t' || (c >= 0x20 && c < 0x7f) {
+            out.push(c as char);
+        } else {
+            out.push_str(&format!("\\{:03}", c));
+        }
+    }
+    if quote {
+        out.push('"');
+    }
+    out
+}
+
+fn svc_alpn(val: &[u8]) -> String {
+    let mut quote = false;
+    let mut p = 0;
+    while p < val.len() {
+        let n = val[p] as usize;
+        p += 1;
+        if p + n > val.len() {
+            break;
+        }
+        if val[p..p + n].iter().any(|c| c.is_ascii_whitespace()) {
+            quote = true;
+        }
+        p += n;
+    }
+    let mut out = String::new();
+    if quote {
+        out.push('"');
+    }
+    let mut first = true;
+    p = 0;
+    while p < val.len() {
+        let n = val[p] as usize;
+        p += 1;
+        if p + n > val.len() {
+            break;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        for &c in &val[p..p + n] {
+            if c == b'"' || c == b'\\' || c == b',' {
+                out.push('\\');
+                out.push(c as char);
+            } else if c == b'\t' || (c >= 0x20 && c < 0x7f) {
+                out.push(c as char);
+            } else {
+                out.push_str(&format!("\\{:03}", c));
+            }
+        }
+        p += n;
+    }
+    if quote {
+        out.push('"');
+    }
+    out
+}
+
+fn parse_https_record(data: &[u8]) -> String {
+    if data.len() < 2 {
+        return String::new();
+    }
+    let read_u16 = |b: &[u8]| -> u16 { ((b[0] as u16) << 8) | (b[1] as u16) };
+    let mut pos = 0;
+    let priority = read_u16(&data[pos..pos + 2]);
     pos += 2;
 
-    // 2. Target Name (Uncompressed labels)
     let mut target_name = String::new();
     loop {
-        if pos >= data.len() { break; }
+        if pos >= data.len() {
+            break;
+        }
         let len = data[pos] as usize;
         pos += 1;
-        if len == 0 { break; }
-        if pos + len > data.len() { return "Malformed".to_string(); }
-        if !target_name.is_empty() { target_name.push('.'); }
-        target_name.push_str(&String::from_utf8_lossy(&data[pos..pos+len]));
+        if len == 0 {
+            break;
+        }
+        if len & 0xc0 == 0xc0 || pos + len > data.len() {
+            return String::new();
+        }
+        if !target_name.is_empty() {
+            target_name.push('.');
+        }
+        target_name.push_str(&String::from_utf8_lossy(&data[pos..pos + len]));
         pos += len;
     }
-    if target_name.is_empty() { target_name = ".".to_string(); }
+    if target_name.is_empty() {
+        target_name = ".".to_string();
+    }
 
-    let mut parts = Vec::new();
-    parts.push(format!("{} {}", priority, target_name));
-
-    // 3. Params
+    let mut parts = vec![format!("{} {}", priority, target_name)];
     while pos + 4 <= data.len() {
-        let key = read_u16(&data[pos..pos+2]);
-        pos += 2;
-        let val_len = read_u16(&data[pos..pos+2]) as usize;
-        pos += 2;
-        if pos + val_len > data.len() { break; }
-        let val = &data[pos..pos+val_len];
-        pos += val_len;
-
-        match key {
-            1 => { // alpn
-                let mut alpns = Vec::new();
-                let mut p = 0;
-                while p < val.len() {
-                    let l = val[p] as usize;
-                    p += 1;
-                    if p + l > val.len() { break; }
-                    alpns.push(String::from_utf8_lossy(&val[p..p+l]).to_string());
-                    p += l;
-                }
-                parts.push(format!("alpn=\"{}\"", alpns.join(",")));
-            },
-            2 => parts.push("no-default-alpn".to_string()),
-            3 => if val.len() == 2 { parts.push(format!("port={}", read_u16(val))); },
-            4 => if val.len() % 4 == 0 {
-                let mut ips = Vec::new();
-                for chunk in val.chunks(4) {
-                     ips.push(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]).to_string());
-                }
-                parts.push(format!("ipv4hint=\"{}\"", ips.join(",")));
-            },
-            6 => if val.len() % 16 == 0 {
-                let mut ips = Vec::new();
-                for chunk in val.chunks(16) {
-                    let mut tmp = [0u8; 16];
-                    tmp.copy_from_slice(chunk);
-                    ips.push(Ipv6Addr::from(tmp).to_string());
-                }
-                parts.push(format!("ipv6hint=\"{}\"", ips.join(",")));
-            },
-            _ => {}
+        let key = read_u16(&data[pos..pos + 2]);
+        let val_len = read_u16(&data[pos + 2..pos + 4]) as usize;
+        pos += 4;
+        if pos + val_len > data.len() {
+            break;
         }
+        let val = &data[pos..pos + val_len];
+        pos += val_len;
+        let name = svc_key_name(key);
+        if val_len == 0 {
+            parts.push(name);
+            continue;
+        }
+        let rendered = match key {
+            0 => {
+                let mut keys = Vec::new();
+                let mut i = 0;
+                while i + 2 <= val.len() {
+                    keys.push(svc_key_name(read_u16(&val[i..i + 2])));
+                    i += 2;
+                }
+                keys.join(",")
+            }
+            1 => svc_alpn(val),
+            3 => {
+                if val.len() == 2 {
+                    read_u16(val).to_string()
+                } else {
+                    String::new()
+                }
+            }
+            4 => {
+                if val.len() % 4 == 0 {
+                    val.chunks(4)
+                        .map(|c| Ipv4Addr::new(c[0], c[1], c[2], c[3]).to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    String::new()
+                }
+            }
+            5 => b64(val),
+            6 => {
+                if val.len() % 16 == 0 {
+                    val.chunks(16)
+                        .map(|c| {
+                            let mut tmp = [0u8; 16];
+                            tmp.copy_from_slice(c);
+                            Ipv6Addr::from(tmp).to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    String::new()
+                }
+            }
+            _ => svc_escape(val),
+        };
+        if rendered.is_empty() {
+            continue;
+        }
+        parts.push(format!("{}={}", name, rendered));
     }
     parts.join(" ")
 }
@@ -233,23 +482,13 @@ fn parse_packet(pkt: &PacketObj, ctx: &ContextMap, cache: &DashMap<String, Cache
             if name_len > 0 {
                 // Parse Name for the string (pass slice + full payload)
                 if let Ok(name) = Name::scan(&payload[pos..], payload) {
-                    flow.query_name = name.to_string();
+                    flow.query_name = strip_dot(name.to_string());
                 }
                 pos += name_len;
                 
                 if pos + 4 <= payload.len() {
                     let qtype_u16 = read_u16(pos);
-                    // pos += 2; // skip type
-                    // pos += 2; // skip class
-                    
-                    if qtype_u16 == 65 {
-                        flow.query_type = "HTTPS".to_string();
-                    } else {
-                        flow.query_type = format!("{:?}", dns_parser::QueryType::parse(qtype_u16).unwrap_or(dns_parser::QueryType::A));
-                        if flow.query_type == "A" && qtype_u16 != 1 {
-                             flow.query_type = format!("TYPE{}", qtype_u16);
-                        }
-                    }
+                    flow.query_type = type_name(qtype_u16);
                     ctx.insert(key, (flow, pkt.ts));
                 }
             }
@@ -275,11 +514,12 @@ fn parse_packet(pkt: &PacketObj, ctx: &ContextMap, cache: &DashMap<String, Cache
 
             let mut answers: Vec<String> = Vec::new();
             let mut ttl_val = 0;
+            let mut last_type = String::new();
 
+            if rcode_val == 0 {
             for _ in 0..an_count {
                 if pos >= payload.len() { break; }
                 
-                // 1. Parse Name (we don't strictly need the string here, just skip it, but let's be safe)
                 let name_len = match get_wire_name_len(payload, pos) {
                     Some(l) => l,
                     None => break,
@@ -292,70 +532,104 @@ fn parse_packet(pkt: &PacketObj, ctx: &ContextMap, cache: &DashMap<String, Cache
                 let attl = ((payload[pos+4] as u32) << 24) | ((payload[pos+5] as u32) << 16) | ((payload[pos+6] as u32) << 8) | (payload[pos+7] as u32);
                 let rdlen = read_u16(pos+8) as usize;
                 
-                pos += 10; // Advance past record header
+                pos += 10;
 
                 if pos + rdlen > payload.len() { break; }
                 let rdata = &payload[pos..pos+rdlen];
 
-                if ttl_val == 0 { ttl_val = attl; }
-
                 let ans_str = match atype {
-                    1 => { // A
+                    1 => {
                         if rdata.len() == 4 {
                              Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]).to_string()
-                        } else { "Malformed IPv4".to_string() }
+                        } else { String::new() }
                     },
-                    28 => { // AAAA
+                    28 => {
                         if rdata.len() == 16 {
                             let mut buf = [0u8; 16];
                             buf.copy_from_slice(rdata);
                             Ipv6Addr::from(buf).to_string()
-                        } else { "Malformed IPv6".to_string() }
+                        } else { String::new() }
                     },
-                    5 | 2 | 12 => { // CNAME, NS, PTR
-                         // For these, RDATA contains a name. We must pass rdata as start, and full payload for pointers.
+                    5 | 2 | 12 | 39 => {
                          match Name::scan(rdata, payload) {
-                             Ok(n) => n.to_string(),
-                             Err(_) => "Bad Name".to_string(),
+                             Ok(n) => strip_dot(n.to_string()),
+                             Err(_) => String::new(),
                          }
                     },
-                    15 => { // MX
+                    15 => {
                         if rdata.len() > 2 {
-                            let pref = read_u16(pos); // pos points to start of rdata in payload
-                            // Name starts after 2 bytes of preference
+                            let pref = read_u16(pos);
                             match Name::scan(&payload[pos+2..], payload) {
-                                Ok(n) => format!("{} {}", pref, n),
-                                Err(_) => "Bad MX".to_string()
+                                Ok(n) => format!("{} {}", pref, strip_dot(n.to_string())),
+                                Err(_) => String::new()
                             }
-                        } else { "Bad MX".to_string() }
+                        } else { String::new() }
                     },
-                    16 => { // TXT
-                         String::from_utf8_lossy(rdata).to_string()
+                    33 => {
+                        if rdata.len() >= 6 {
+                            let pri = read_u16(pos);
+                            let weight = read_u16(pos + 2);
+                            let port = read_u16(pos + 4);
+                            match Name::scan(&payload[pos+6..], payload) {
+                                Ok(n) => format!("{} {} {} {}", pri, weight, port, strip_dot(n.to_string())),
+                                Err(_) => String::new()
+                            }
+                        } else { String::new() }
                     },
-                    65 => { // HTTPS
-                        parse_https_record(rdata)
+                    6 => {
+                        let mlen = get_wire_name_len(payload, pos).unwrap_or(0);
+                        if mlen > 0 && mlen < rdlen {
+                            if let Ok(mname) = Name::scan(&payload[pos..], payload) {
+                                let rpos = pos + mlen;
+                                let rlen = get_wire_name_len(payload, rpos).unwrap_or(0);
+                                if rlen > 0 && mlen + rlen + 4 <= rdlen {
+                                    if let Ok(rname) = Name::scan(&payload[rpos..], payload) {
+                                        let off = pos + mlen + rlen;
+                                        let serial = ((payload[off] as u32) << 24)
+                                            | ((payload[off + 1] as u32) << 16)
+                                            | ((payload[off + 2] as u32) << 8)
+                                            | (payload[off + 3] as u32);
+                                        format!("{} {} {}", strip_dot(mname.to_string()), strip_dot(rname.to_string()), serial)
+                                    } else { String::new() }
+                                } else { String::new() }
+                            } else { String::new() }
+                        } else { String::new() }
                     },
-                    _ => format!("TYPE{}[{}]", atype, rdlen)
+                    16 | 99 => txt_chars(rdata),
+                    64 | 65 => parse_https_record(rdata),
+                    _ => {
+                        if rdlen > 0 { format!("DATA[{} bytes]", rdlen) } else { String::new() }
+                    }
                 };
                 
-                answers.push(ans_str);
-                pos += rdlen; // Advance past rdata
+                if !ans_str.is_empty() {
+                    last_type = type_name(atype);
+                    ttl_val = attl;
+                    answers.push(ans_str);
+                }
+                pos += rdlen;
+            }
             }
             
             answers.sort();
 
-            let rc_str = match rcode_val {
-                0 => "NOERROR", 3 => "NXDOMAIN", 1 => "FORMERR", 2 => "SERVFAIL", 4 => "NOTIMP", 5 => "REFUSED", _ => "UNKNOWN"
-            };
+            let rc_str = rcode_name(rcode_val);
+            if rcode_val == 0 && answers.is_empty() {
+                return;
+            }
 
-            let clean_atype = flow.query_type.clone();
+            let clean_atype = if last_type.is_empty() {
+                flow.query_type.clone()
+            } else {
+                last_type
+            };
             
             let record = LogRecord {
                 query: flow.query_name.clone(),
                 qtype: flow.query_type.clone(),
                 answer: answers.clone(),
                 atype: clean_atype.clone(),
-                rc: rc_str.to_string(),
+                rc: rc_str.clone(),
                 ttl: ttl_val,
                 src_ip: flow.src_ip.clone(),
                 dst_ip: flow.dst_ip.clone(),
@@ -365,9 +639,9 @@ fn parse_packet(pkt: &PacketObj, ctx: &ContextMap, cache: &DashMap<String, Cache
                 vlan: flow.vlan,
                 qid: flow.tx_id,
                 latency,
-                fts: to_iso(pkt.ts),
+                fts: to_iso(start_ts),
                 lts: to_iso(pkt.ts),
-                ts: chrono::Utc::now().to_rfc3339(),
+                ts: now_iso(),
                 count: 1, 
             };
 
@@ -381,11 +655,21 @@ fn parse_packet(pkt: &PacketObj, ctx: &ContextMap, cache: &DashMap<String, Cache
             if let Some(mut entry) = cache.get_mut(&cache_key) {
                 let state = entry.value_mut();
                 state.record.count += 1;
-                state.record.lts = to_iso(pkt.ts);
-                if record.ttl > state.record.ttl { state.record.ttl = record.ttl; }
+                state.record.lts = record.lts;
+                state.record.src_ip = record.src_ip;
+                state.record.dst_ip = record.dst_ip;
+                state.record.src_port = record.src_port;
+                state.record.dst_port = record.dst_port;
+                state.record.proto = record.proto;
+                state.record.vlan = record.vlan;
+                state.record.qid = record.qid;
+                state.record.latency = record.latency;
+                if record.ttl > state.record.ttl {
+                    state.record.ttl = record.ttl;
+                }
                 state.last_seen = SystemTime::now();
             } else {
-                println!("{}", serde_json::to_string(&record).unwrap());
+                emit(&record);
                 cache.insert(cache_key, CacheState {
                     record,
                     last_seen: SystemTime::now(),
