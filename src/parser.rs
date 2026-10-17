@@ -1,7 +1,7 @@
 use crate::capture::PacketObj;
 use crate::dns_utils::{LogRecord, DnsFlow};
+use crate::reasm::{L4Msg, Reassembler};
 use crossbeam_channel::Receiver;
-use etherparse::{PacketHeaders, IpHeader, TransportHeader, VlanHeader};
 use dashmap::DashMap;
 use std::time::{SystemTime, Duration};
 use log::info;
@@ -32,8 +32,9 @@ pub fn run_parser(rx: Receiver<PacketObj>, cache_time: u64, print_time: u64, che
 
     info!("Parser thread started (Cache: {}s, Print: {}s, Check: {}s)", cache_time, print_time, check_interval);
 
+    let mut reasm = Reassembler::new();
     while let Ok(pkt) = rx.recv() {
-        parse_packet(&pkt, &context, &output_cache);
+        parse_packet(&pkt, &mut reasm, &context, &output_cache);
     }
     // Write each cache entry's pending sightings. cnt is that
     // unwritten count. An entry already fully logged is skipped.
@@ -90,6 +91,7 @@ fn type_name(code: u16) -> String {
         5 => "CNAME",
         6 => "SOA",
         12 => "PTR",
+        13 => "HINFO",
         15 => "MX",
         16 => "TXT",
         17 => "RP",
@@ -424,33 +426,20 @@ fn parse_https_record(data: &[u8]) -> String {
     parts.join(" ")
 }
 
-// --- MAIN PARSER FUNCTION ---
-fn parse_packet(pkt: &PacketObj, ctx: &ContextMap, cache: &DashMap<String, CacheState>) {
-    let headers = match PacketHeaders::from_ethernet_slice(&pkt.data) {
-        Ok(h) => h,
-        Err(_) => return, 
-    };
-    
-    let vlan_id = match headers.vlan {
-        Some(VlanHeader::Single(h)) => h.vlan_identifier,
-        Some(VlanHeader::Double(h)) => h.outer.vlan_identifier,
-        None => 0,
-    };
+fn parse_packet(pkt: &PacketObj, reasm: &mut Reassembler, ctx: &ContextMap, cache: &DashMap<String, CacheState>) {
+    for msg in reasm.push(&pkt.data, pkt.ts) {
+        parse_dns(pkt.ts, &msg, ctx, cache);
+    }
+}
 
-    let (src_ip, dst_ip) = match headers.ip {
-        Some(IpHeader::Version4(h, _)) => (h.source.map(|x| x.to_string()).join("."), h.destination.map(|x| x.to_string()).join(".")),
-        Some(IpHeader::Version6(h, _)) => (h.source.map(|x| x.to_string()).join(":"), h.destination.map(|x| x.to_string()).join(":")),
-        _ => return,
-    };
-
-    let (src_port, dst_port, proto) = match headers.transport {
-        Some(TransportHeader::Udp(u)) => (u.source_port, u.destination_port, 17),
-        Some(TransportHeader::Tcp(t)) => (t.source_port, t.destination_port, 6),
-        _ => return, 
-    };
-
-    let payload = headers.payload;
-    // Manual DNS Header check (12 bytes)
+fn parse_dns(ts: SystemTime, msg: &L4Msg, ctx: &ContextMap, cache: &DashMap<String, CacheState>) {
+    let vlan_id = msg.vlan;
+    let src_ip = msg.src.clone();
+    let dst_ip = msg.dst.clone();
+    let src_port = msg.sport;
+    let dst_port = msg.dport;
+    let proto = msg.proto;
+    let payload = msg.payload.as_slice();
     if payload.len() < 12 { return; }
 
     // Helper to read u16
@@ -489,7 +478,7 @@ fn parse_packet(pkt: &PacketObj, ctx: &ContextMap, cache: &DashMap<String, Cache
                 if pos + 4 <= payload.len() {
                     let qtype_u16 = read_u16(pos);
                     flow.query_type = type_name(qtype_u16);
-                    ctx.insert(key, (flow, pkt.ts));
+                    ctx.insert(key, (flow, ts));
                 }
             }
         }
@@ -499,7 +488,7 @@ fn parse_packet(pkt: &PacketObj, ctx: &ContextMap, cache: &DashMap<String, Cache
         
         // Remove `mut flow` -> just `flow`
         if let Some((_, (flow, start_ts))) = ctx.remove(&key) {
-            let latency = pkt.ts.duration_since(start_ts).unwrap_or_default().as_secs_f64();
+            let latency = ts.duration_since(start_ts).unwrap_or_default().as_secs_f64();
             
             // Skip Questions Section
             for _ in 0..qd_count {
@@ -640,7 +629,7 @@ fn parse_packet(pkt: &PacketObj, ctx: &ContextMap, cache: &DashMap<String, Cache
                 qid: flow.tx_id,
                 latency,
                 fts: to_iso(start_ts),
-                lts: to_iso(pkt.ts),
+                lts: to_iso(ts),
                 ts: now_iso(),
                 count: 1, 
             };

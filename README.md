@@ -7,9 +7,9 @@ A high-performance, multithreaded DNS sniffer written in Rust, focusing on memor
 * **Safe**: Written in 100% safe Rust (no `unsafe` blocks in application logic).
 * **Compatible**: Outputs JSON logs schema-compatible with the passivednsgo version.
 * **Tunable**: Configurable cache eviction, heartbeat printing, and garbage collection intervals.
+* **Reassembly**: IPv4 and IPv6 fragments are reassembled. TCP DNS messages are buffered across segments.
 
 ## Limitations
-* **TCP**: No TCP Reassembly. It processes packets individually. If a DNS response over TCP is fragmented or split across packets, this tool will not parse it.
 * **Fanout**: Uses a single capture handle. It does not utilize kernel-level `AF_PACKET` fanout groups, so capture throughput is limited to a single CPU core.
 
 ## Usage

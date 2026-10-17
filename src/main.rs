@@ -1,6 +1,7 @@
 mod capture;
 mod parser;
 mod dns_utils;
+mod reasm;
 
 use clap::Parser;
 use log::{info, error};
